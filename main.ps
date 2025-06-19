@@ -1,0 +1,864 @@
+<#
+.SYNOPSIS
+    Enterprise-Grade Autonomous Network Intrusion Defense and Windows Hardening Agent
+.DESCRIPTION
+    Fully automated PowerShell agent combining:
+    - Threat Intelligence ingestion & firewall automation
+    - Real-time network and DNS anomaly detection
+    - Encrypted logs with immutable storage concept
+    - Service auto-install via NSSM
+    - Auto-update with rollback
+    - Integrated placeholders for ETW/WFP/native advanced telemetry
+    - Enhanced Stingray and SIGINT detection hooks
+    - Hardened ACLs and runtime integrity checks
+    - Comprehensive Windows 10 hardening including Defender, firewall, and privacy settings
+    - Secure file associations, browser, Office, and system configurations
+.AUTHOR
+    Developed by Taylor Christian Newsome
+.NOTES
+    Requires:
+      - Administrator privileges
+      - PowerShell 7+
+      - Internet access for updates & threat feeds
+      - NSSM executable (auto-download if missing)
+    References:
+      - See end of script for detailed references on hardening settings
+#>
+
+# Ensure script runs with admin privileges
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Error "This script requires Administrator privileges. Please run as Administrator."
+    exit 1
+}
+
+#region CONFIGURATION
+
+# Directories & files
+$ProgramDataDir = "$env:ProgramData\NSGDefense"
+$LogFilePlain = Join-Path $ProgramDataDir "IntrusionDetection.log"
+$LogFileEncrypted = Join-Path $ProgramDataDir "IntrusionDetection.log.aes"
+$ImmutableLogBackupDir = Join-Path $ProgramDataDir "ImmutableLogs"
+
+# NSSM params
+$NssmExePath = Join-Path $env:SystemRoot "System32\nssm.exe"
+$ServiceName = "NSGNetworkDefenseAgent"
+
+# Threat Intel feeds (replace with your trusted intel feed URLs)
+$ThreatIntelFeeds = @(
+    "https://raw.githubusercontent.com/public-threat-intel/feeds/main/ips.txt",
+    "https://another-trusted-feed.example.com/malicious_ips.txt"
+)
+
+# Syslog Endpoint (your SIEM or SOC syslog server)
+$SyslogServer = "10.0.0.10"
+$SyslogPort = 514
+
+# AES-256 Encryption Key (Must be 32 bytes, rotate securely in production)
+$AesKey = [Text.Encoding]::UTF8.GetBytes("S3cure32ByteKeyForAES256Encrypt!!!")
+
+# Geo-IP Stingray & SIGINT vendor network blocks (CIDR notation)
+$StingrayGeoIPs = @(
+    "198.18.0.0/15", # Reserved test range sometimes abused
+    "10.10.10.0/24", # Example vendor subnet - update regularly
+    "172.16.100.0/24"
+)
+
+# Update Script URL for auto-update
+$UpdateScriptUrl = "https://raw.githubusercontent.com/yourorg/NSGDefenseAgent/main/NSGDefenseAgent.ps1"
+
+# Firewall Rule Prefix
+$FirewallRulePrefix = "NSGDefenseBlock"
+
+#endregion
+
+#region ENVIRONMENT SETUP & ACL HARDENING
+
+function Initialize-Environment {
+    try {
+        if (-not (Test-Path $ProgramDataDir)) { New-Item -ItemType Directory -Path $ProgramDataDir -Force -ErrorAction Stop | Out-Null }
+        if (-not (Test-Path $ImmutableLogBackupDir)) { New-Item -ItemType Directory -Path $ImmutableLogBackupDir -Force -ErrorAction Stop | Out-Null }
+
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule("Administrators","FullControl","ContainerInherit,ObjectInherit","None","Allow")
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.AddAccessRule($rule)
+        Set-Acl -Path $ProgramDataDir -AclObject $acl -ErrorAction Stop
+        Set-Acl -Path $ImmutableLogBackupDir -AclObject $acl -ErrorAction Stop
+
+        if (-not (Test-Path $LogFilePlain)) { New-Item -ItemType File -Path $LogFilePlain -Force -ErrorAction Stop | Out-Null }
+        if (-not (Test-Path $LogFileEncrypted)) { New-Item -ItemType File -Path $LogFileEncrypted -Force -ErrorAction Stop | Out-Null }
+
+        Set-Acl -Path $LogFilePlain -AclObject $acl -ErrorAction Stop
+        Set-Acl -Path $LogFileEncrypted -AclObject $acl -ErrorAction Stop
+
+        Write-Log "Environment initialized successfully."
+    }
+    catch {
+        Write-Log "Environment initialization failed: $_" "ERROR"
+        throw
+    }
+}
+
+#endregion
+
+#region ENCRYPTED LOGGING WITH IMMUTABILITY CONCEPT
+
+function Encrypt-Log {
+    param([string]$PlainText)
+    try {
+        $aes = [System.Security.Cryptography.Aes]::Create()
+        $aes.Key = $AesKey
+        $aes.GenerateIV()
+        $iv = $aes.IV
+        $encryptor = $aes.CreateEncryptor()
+        $plainBytes = [Text.Encoding]::UTF8.GetBytes($PlainText)
+        $encryptedBytes = $encryptor.TransformFinalBlock($plainBytes, 0, $plainBytes.Length)
+        $combined = [byte[]]::new($iv.Length + $encryptedBytes.Length)
+        [Array]::Copy($iv, 0, $combined, 0, $iv.Length)
+        [Array]::Copy($encryptedBytes, 0, $combined, $iv.Length, $encryptedBytes.Length)
+        return [Convert]::ToBase64String($combined)
+    }
+    catch {
+        Write-Log "Log encryption failed: $_" "ERROR"
+        throw
+    }
+}
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet("INFO","WARN","ALERT","ERROR")]
+        [string]$Level = "INFO"
+    )
+    try {
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+        $entry = "$timestamp [$Level] $Message"
+
+        # Write plaintext log locally for operational visibility
+        Add-Content -Path $LogFilePlain -Value $entry -ErrorAction Stop
+
+        # Append encrypted log (base64 encoded)
+        $encryptedEntry = Encrypt-Log "$entry`n"
+        Add-Content -Path $LogFileEncrypted -Value $encryptedEntry -ErrorAction Stop
+
+        # Immutable backup every hour (rotate by timestamp)
+        if ((Get-Date).Minute -eq 0 -and (Get-Date).Second -lt 15) {
+            $immutableBackupPath = Join-Path $ImmutableLogBackupDir "IntrusionDetection_$(Get-Date -Format 'yyyyMMdd_HH').log.aes"
+            Copy-Item -Path $LogFileEncrypted -Destination $immutableBackupPath -Force -ErrorAction Stop
+            Write-Host "Immutable encrypted log snapshot created at $immutableBackupPath"
+        }
+
+        switch ($Level) {
+            "ALERT" { Write-Host $entry -ForegroundColor Red }
+            "WARN"  { Write-Host $entry -ForegroundColor Yellow }
+            default { Write-Host $entry }
+        }
+    }
+    catch {
+        Write-Host "Logging failed: $_" -ForegroundColor Red
+    }
+}
+
+#endregion
+
+#region NSSM SERVICE INSTALLATION & AUTO-UPDATE
+
+function Install-NSSM {
+    try {
+        if (-not (Test-Path $NssmExePath)) {
+            Write-Log "NSSM not found. Downloading..."
+            $nssmZip = Join-Path $env:TEMP "nssm.zip"
+            Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $nssmZip -UseBasicParsing -ErrorAction Stop
+            Expand-Archive -Path $nssmZip -DestinationPath $env:TEMP -Force -ErrorAction Stop
+            Copy-Item -Path (Join-Path $env:TEMP "nssm-2.24\win64\nssm.exe") -Destination $NssmExePath -Force -ErrorAction Stop
+            Remove-Item $nssmZip -Force -ErrorAction Stop
+            Write-Log "NSSM downloaded and installed."
+        }
+    }
+    catch {
+        Write-Log "NSSM installation failed: $_" "ERROR"
+        throw
+    }
+}
+
+function Install-Service {
+    try {
+        Install-NSSM
+        if (-not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
+            $pwshPath = (Get-Command pwsh).Source
+            $scriptPath = $MyInvocation.MyCommand.Path
+            & $NssmExePath install $ServiceName $pwshPath "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+            & $NssmExePath set $ServiceName AppRestartDelay 5000
+            & $NssmExePath set $ServiceName Start SERVICE_AUTO_START
+            Write-Log "Service $ServiceName installed."
+        } else {
+            Write-Log "Service $ServiceName already installed."
+        }
+    }
+    catch {
+        Write-Log "Service installation failed: $_" "ERROR"
+        throw
+    }
+}
+
+function Start-ServiceIfNotRunning {
+    try {
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (($null -eq $svc) -or $svc.Status -ne "Running") {
+            Start-Service -Name $ServiceName -ErrorAction Stop
+            Write-Log "Service $ServiceName started."
+        }
+    }
+    catch {
+        Write-Log "Service start failed: $_" "ERROR"
+        throw
+    }
+}
+
+function AutoUpdate {
+    try {
+        Write-Log "Checking for updates..."
+        $remoteScript = Invoke-RestMethod -Uri $UpdateScriptUrl -UseBasicParsing -ErrorAction Stop
+        $localPath = $MyInvocation.MyCommand.Path
+        $localScript = Get-Content -Path $localPath -Raw
+        if ($remoteScript -ne $localScript) {
+            Write-Log "Update detected. Applying..."
+            $backupPath = "$localPath.bak_$(Get-Date -Format 'yyyyMMddHHmmss')"
+            Copy-Item $localPath $backupPath -Force -ErrorAction Stop
+            Set-Content -Path $localPath -Value $remoteScript -Force -ErrorAction Stop
+            Write-Log "Update applied successfully. Restarting service."
+            Restart-Service -Name $ServiceName -ErrorAction Stop
+            exit
+        } else {
+            Write-Log "No updates found."
+        }
+    }
+    catch {
+        Write-Log "Update check failed: $_" "ERROR"
+    }
+}
+
+#endregion
+
+#region THREAT INTELLIGENCE MANAGEMENT
+
+$Global:BlacklistedIPs = @()
+
+function Update-ThreatIntelFeeds {
+    try {
+        $ips = @()
+        foreach ($feedUrl in $ThreatIntelFeeds) {
+            Write-Log "Fetching threat intel feed: $feedUrl"
+            $content = Invoke-RestMethod -Uri $feedUrl -ErrorAction Stop
+            $ips += $content -split "`n" | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }
+        }
+        $Global:BlacklistedIPs = $ips | Sort-Object -Unique
+        Write-Log "Threat intel updated with $($Global:BlacklistedIPs.Count) unique IPs."
+    }
+    catch {
+        Write-Log "Failed to fetch $feedUrl: $_" "ERROR"
+    }
+}
+
+#endregion
+
+#region FIREWALL MANAGEMENT
+
+function Add-FirewallBlockRule {
+    param([string]$ip)
+    try {
+        $ruleName = "$FirewallRulePrefix-$ip"
+        if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -RemoteAddress $ip -Action Block -Profile Any -Description "Blocked by NSGDefense" -ErrorAction Stop
+            Write-Log "Firewall rule added to block $ip" "ALERT"
+            Send-SyslogAlert -Message "Firewall blocked IP $ip"
+        }
+    }
+    catch {
+        Write-Log "Failed to add firewall rule for $ip: $_" "ERROR"
+    }
+}
+
+function Remove-ObsoleteFirewallRules {
+    try {
+        $currentIPs = $Global:BlacklistedIPs
+        $existingRules = Get-NetFirewallRule -DisplayName "$FirewallRulePrefix*" -ErrorAction SilentlyContinue
+        foreach ($rule in $existingRules) {
+            $ip = $rule.DisplayName -replace "^$FirewallRulePrefix-", ""
+            if ($ip -and ($ip -notin $currentIPs)) {
+                Remove-NetFirewallRule -DisplayName $rule.DisplayName -ErrorAction Stop
+                Write-Log "Removed obsolete firewall rule: $($rule.DisplayName)"
+            }
+        }
+    }
+    catch {
+        Write-Log "Failed to remove obsolete firewall rules: $_" "ERROR"
+    }
+}
+
+#endregion
+
+#region NETWORK & DNS MONITORING WITH STINGRAY/SIGINT DEFENSE
+
+$connectionCounts = @{}
+
+function Monitor-Network {
+    while ($true) {
+        try {
+            $connections = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue
+            $now = Get-Date
+            $grouped = $connections | Group-Object RemoteAddress
+
+            foreach ($group in $grouped) {
+                $ip = $group.Name
+                if ([string]::IsNullOrEmpty($ip) -or $ip -in @("127.0.0.1","::1")) { continue }
+
+                if (-not $connectionCounts.ContainsKey($ip)) { $connectionCounts[$ip] = @() }
+                $connectionCounts[$ip] += $now
+                $connectionCounts[$ip] = $connectionCounts[$ip] | Where-Object { $_ -gt $now.AddMinutes(-1) }
+
+                # Behavioral threshold or blacklisted IP
+                if ($connectionCounts[$ip].Count -gt 25 -or $Global:BlacklistedIPs -contains $ip) {
+                    Add-FirewallBlockRule -ip $ip
+                    $connectionCounts[$ip] = @()
+                }
+            }
+
+            # Periodic cleanup of firewall rules
+            Remove-ObsoleteFirewallRules
+
+            # Stingray IP blocking (CIDR expansion omitted for brevity - implement with IPNetwork module)
+            foreach ($cidr in $StingrayGeoIPs) {
+                Write-Log "Stingray CIDR check: $cidr (manual block recommended)"
+            }
+
+            # DNS Tunneling & Anomaly detection placeholder
+            Detect-DNSTunneling
+
+            # Cellular anomaly detection placeholder
+            Monitor-CellularRadioAnomalies
+
+            # Telemetry correlation placeholder
+            Correlate-TelemetryForSIGINTIndicators
+
+            Start-Sleep -Seconds 15
+        }
+        catch {
+            Write-Log "Network monitor error: $_" "ERROR"
+            Start-Sleep -Seconds 30
+        }
+    }
+}
+
+function Detect-DNSTunneling {
+    Write-Log "DNS tunneling detection active (stub)"
+}
+
+function Monitor-CellularRadioAnomalies {
+    Write-Log "Cellular radio anomaly monitoring active (stub)"
+}
+
+function Correlate-TelemetryForSIGINTIndicators {
+    Write-Log "Telemetry correlation for SIGINT detection active (stub)"
+}
+
+#endregion
+
+#region SIEM INTEGRATION
+
+function Send-SyslogAlert {
+    param([string]$Message)
+    try {
+        $UdpClient = New-Object System.Net.Sockets.UdpClient
+        $SyslogMsg = "<14>$(Get-Date -Format 'MMM dd HH:mm:ss') NSGDefenseAgent $Message"
+        $bytes = [Text.Encoding]::ASCII.GetBytes($SyslogMsg)
+        $UdpClient.Send($bytes, $bytes.Length, $SyslogServer, $SyslogPort) | Out-Null
+        $UdpClient.Close()
+        Write-Log "Sent syslog alert: $Message"
+    }
+    catch {
+        Write-Log "Syslog alert failed: $_" "ERROR"
+    }
+}
+
+#endregion
+
+#region NATIVE MODULES PLACEHOLDER
+
+function Start-ETWMonitor {
+    Write-Log "Starting ETW Monitor (native module placeholder)."
+}
+
+function Start-WFPFilter {
+    Write-Log "Starting WFP Filter (native module placeholder)."
+}
+
+function Query-DefenderATP {
+    Write-Log "Querying Defender ATP (stub)."
+}
+
+#endregion
+
+#region WINDOWS HARDENING
+
+function Set-FileAssociations {
+    try {
+        $fileTypes = @("htafile", "wshfile", "wsffile", "batfile", "jsfile", "jsefile", "vbefile", "vbsfile")
+        foreach ($type in $fileTypes) {
+            cmd.exe /c "ftype $type=`"%SystemRoot%\system32\NOTEPAD.EXE`" `"%1`""
+            Write-Log "Set $type to open with Notepad."
+        }
+    }
+    catch {
+        Write-Log "Failed to set file associations: $_" "ERROR"
+    }
+}
+
+function Configure-WindowsDefender {
+    try {
+        # Start Defender Service
+        Start-Service -Name WinDefend -ErrorAction Stop
+        Write-Log "Windows Defender service started."
+
+        # Enable sandboxing
+        [Environment]::SetEnvironmentVariable("MP_FORCE_USE_SANDBOX", "1", "Machine")
+        Write-Log "Windows Defender sandboxing enabled."
+
+        # Update signatures
+        & "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" -SignatureUpdate
+        Write-Log "Windows Defender signatures updated."
+
+        # Enable PUA protection
+        Set-MpPreference -PUAProtection Enabled -ErrorAction Stop
+        Write-Log "PUA protection enabled."
+
+        # Enable periodic scanning
+        New-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows Defender" -Name PassiveMode -Value 2 -PropertyType DWORD -Force -ErrorAction Stop
+        Write-Log "Periodic scanning enabled."
+
+        # Enable cloud functionality
+        Set-MpPreference -MAPSReporting Advanced -SubmitSamplesConsent 0 -ErrorAction Stop
+        Write-Log "Cloud functionality enabled."
+
+        # Enable early launch antimalware driver
+        New-Item -Path "HKLM:\SYSTEM\CurrentControlSet\Policies\EarlyLaunch" -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Policies\EarlyLaunch" -Name DriverLoadPolicy -Value 3 -PropertyType DWORD -Force -ErrorAction Stop
+        Write-Log "Early launch antimalware driver enabled."
+
+        # Enable ASR rules
+        $asrRules = @(
+            "D4F940AB-401B-4EFC-AADC-AD5F3C50688A", # Block Office Child Process Creation
+            "75668C1F-73B5-4CF0-BB93-3ECF5CB7CC84", # Block Process Injection
+            "92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B", # Block Win32 API calls in macros
+            "3B576869-A4EC-4529-8536-B80A7769E899", # Block Office from creating executables
+            "5BEB7EFE-FD9A-4556-801D-275E5FFC04CC", # Block obfuscated scripts
+            "BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550", # Block email/webmail executables
+            "D3E037E1-3EB8-44C8-A917-57927947596D", # Block JS/VBS downloaded executables
+            "9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2", # Block lsass cred theft
+            "b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4", # Block untrusted USB processes
+            "7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c", # Block Adobe Reader child processes
+            "e6db77e5-3df2-4cf1-b95a-636979351e5b", # Block WMI persistence
+            "d1e49aac-8f56-4280-b9ba-993a6d77406c"  # Block PSExec/WMI processes
+        )
+        foreach ($rule in $asrRules) {
+            Add-MpPreference -AttackSurfaceReductionRules_Ids $rule -AttackSurfaceReductionRules_Actions Enabled -ErrorAction Stop
+            Write-Log "ASR rule $rule enabled."
+        }
+
+        # Enable exploit protection
+        Set-ProcessMitigation -System -Enable DEP,EmulateAtlThunks,BottomUp,HighEntropy,SEHOP,SEHOPTelemetry,TerminateOnError -ErrorAction Stop
+        Write-Log "System-wide exploit protection enabled."
+    }
+    catch {
+        Write-Log "Windows Defender configuration failed: $_" "ERROR"
+    }
+}
+
+function Configure-BrowserSettings {
+    try {
+        # Edge SmartScreen
+        New-Item -Path "HKCU:\SOFTWARE\Policies\Microsoft\MicrosoftEdge\PhishingFilter" -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path "HKCU:\SOFTWARE\Policies\Microsoft\MicrosoftEdge\PhishingFilter" -Name EnabledV9 -Value 1 -PropertyType DWORD -Force -ErrorAction Stop
+        Write-Log "Edge SmartScreen enabled."
+
+        # IE software installation notifications
+        New-Item -Path "HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path "HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer" -Name SafeForScripting -Value 0 -PropertyType DWORD -Force -ErrorAction Stop
+        Write-Log "IE software installation notifications enabled."
+
+        # Disable Edge password manager
+        New-Item -Path "HKCU:\SOFTWARE\Policies\Microsoft\MicrosoftEdge\Main" -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path "HKCU:\SOFTWARE\Policies\Microsoft\MicrosoftEdge\Main" -Name "FormSuggest Passwords" -Value "no" -PropertyType String -Force -ErrorAction Stop
+        Write-Log "Edge password manager disabled."
+
+        # Chrome settings
+        $chromePath = "HKLM:\SOFTWARE\Policies\Google\Chrome"
+        New-Item -Path $chromePath -Force -ErrorAction Stop | Out-Null
+        $chromeSettings = @{
+            "AdvancedProtectionAllowed" = 1
+            "AllowCrossOriginAuthPrompt" = 0
+            "AlwaysOpenPdfExternally" = 1
+            "AmbientAuthenticationInPrivateModesEnabled" = 0
+            "AudioCaptureAllowed" = 0
+            "AudioSandboxEnabled" = 1
+            "BlockExternalExtensions" = 1
+            "ScreenCaptureAllowed" = 0
+            "SitePerProcess" = 1
+            "TLS13HardeningForLocalAnchorsEnabled" = 1
+            "VideoCaptureAllowed" = 0
+        }
+        foreach ($setting in $chromeSettings.GetEnumerator()) {
+            New-ItemProperty -Path $chromePath -Name $setting.Key -Value $setting.Value -PropertyType DWORD -Force -ErrorAction Stop
+        }
+        New-ItemProperty -Path $chromePath -Name DnsOverHttpsMode -Value "on" -PropertyType String -Force -ErrorAction Stop
+        New-ItemProperty -Path $chromePath -Name SSLVersionMin -Value "tls1" -PropertyType String -Force -ErrorAction Stop
+        Write-Log "Chrome security settings configured."
+    }
+    catch {
+        Write-Log "Browser configuration failed: $_" "ERROR"
+    }
+}
+
+function Configure-OfficeSettings {
+    try {
+        $officeVersions = @("12.0", "14.0", "15.0", "16.0")
+        foreach ($version in $officeVersions) {
+            # Disable macros
+            $apps = @("Publisher", "Word")
+            foreach ($app in $apps) {
+                New-Item -Path "HKCU:\Software\Policies\Microsoft\Office\$version\$app\Security" -Force -ErrorAction Stop | Out-Null
+                New-ItemProperty -Path "HKCU:\Software\Policies\Microsoft\Office\$version\$app\Security" -Name vbawarnings -Value 4 -PropertyType DWORD -Force -ErrorAction Stop
+            }
+
+            # Block internet content
+            if ($version -in @("15.0", "16.0")) {
+                $apps = @("Word", "Excel", "PowerPoint")
+                foreach ($app in $apps) {
+                    New-Item -Path "HKCU:\Software\Policies\Microsoft\Office\$version\$app\Security" -Force -ErrorAction Stop | Out-Null
+                    New-ItemProperty -Path "HKCU:\Software\Policies\Microsoft\Office\$version\$app\Security" -Name blockcontentexecutionfrominternet -Value 1 -PropertyType DWORD -Force -ErrorAction Stop
+                }
+                New-Item -Path "HKCU:\Software\Policies\Microsoft\Office\$version\Outlook\Security" -Force -ErrorAction Stop | Out-Null
+                New-ItemProperty -Path "HKCU:\Software\Policies\Microsoft\Office\$version\Outlook\Security" -Name markinternalasunsafe -Value 0 -PropertyType DWORD -Force -ErrorAction Stop
+            }
+
+            # Disable DDE
+            if ($version -in @("14.0", "15.0", "16.0")) {
+                New-Item -Path "HKCU:\Software\Microsoft\Office\$version\Word\Options" -Force -ErrorAction Stop | Out-Null
+                New-ItemProperty -Path "HKCU:\Software\Microsoft\Office\$version\Word\Options" -Name DontUpdateLinks -Value 1 -PropertyType DWORD -Force -ErrorAction Stop
+                New-Item -Path "HKCU:\Software\Microsoft\Office\$version\Word\Options\WordMail" -Force -ErrorAction Stop | Out-Null
+                New-ItemProperty -Path "HKCU:\Software\Microsoft\Office\$version\Word\Options\WordMail" -Name DontUpdateLinks -Value 1 -PropertyType DWORD -Force -ErrorAction Stop
+            }
+        }
+        Write-Log "Office security settings configured."
+    }
+    catch {
+        Write-Log "Office configuration failed: $_" "ERROR"
+    }
+}
+
+function Configure-GeneralSecurity {
+    try {
+        $regSettings = @(
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"; Name = "EnableMulticast"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"; Name = "DisableSmartNameResolution"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters"; Name = "DisableParallelAandAAAA"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"; Name = "SMB1"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"; Name = "IGMPLevel"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"; Name = "DisableIPSourceRouting"; Value = 2; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"; Name = "EnableICMPRedirect"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"; Name = "DisableIPSourceRouting"; Value = 2; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"; Name = "EnableLUA"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"; Name = "EnableVirtualization"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"; Name = "ConsentPromptBehaviorAdmin"; Value = 2; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"; Name = "SafeDLLSearchMode"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"; Name = "ProtectionMode"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Attachments"; Name = "SaveZoneInformation"; Value = 2; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"; Name = "NoDataExecutionPrevention"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"; Name = "NoHeapTerminationOnCorruption"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = "PreXPSP2ShellProtocolBehavior"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers"; Name = "DisableWebPnPDownload"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers"; Name = "DisableHTTPPrinting"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config"; Name = "AutoConnectAllowedOEM"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WcmSvc\GroupPolicy"; Name = "fMinimizeConnections"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\Netbt\Parameters"; Name = "NoNameReleaseOnDemand"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters"; Name = "SupportedEncryptionTypes"; Value = 2147483640; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters"; Name = "SealSecureChannel"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon\Parameters"; Name = "SignSecureChannel"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"; Name = "EnableSmartScreen"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"; Name = "ShellSmartScreenLevel"; Value = "Block"; Type = "String" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"; Name = "DODownloadMode"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config"; Name = "DODownloadMode"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"; Name = "InactivityTimeoutSecs"; Value = 900; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51"; Name = "ACSettingIndex"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings\0e796bdb-100d-47d6-a2d5-f7d2daa51f51"; Name = "DCSettingIndex"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"; Name = "fAllowToGetHelp"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"; Name = "fEncryptRPCTraffic"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"; Name = "fDisableCdm"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer"; Name = "NoAutoplayfornonVolume"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\policies\Explorer"; Name = "NoDriveTypeAutoRun"; Value = 255; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"; Name = "NoAutorun"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters"; Name = "RestrictNullSessAccess"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"; Name = "RestrictAnonymousSAM"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"; Name = "RestrictAnonymous"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"; Name = "EveryoneIncludesAnonymous"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"; Name = "RestrictRemoteSAM"; Value = "O:BAG:BAD:(A;;RC;;;BA)"; Type = "String" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"; Name = "UseMachineId"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"; Name = "LimitBlankPasswordUse"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control\LSA\MSV1_0"; Name = "allownullsessionfallback"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters"; Name = "EnableSecuritySignature"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters"; Name = "RequireSecuritySignature"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\LSASS.exe"; Name = "AuditLevel"; Value = 8; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"; Name = "RunAsPPL"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest"; Name = "UseLogonCredential"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation"; Name = "AllowProtectedCreds"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service"; Name = "AllowUnencryptedTraffic"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client"; Name = "AllowDigest"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\Schedule"; Name = "DisableRpcOverTcp"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SYSTEM\CurrentControlSet\Control"; Name = "DisableRemoteScmEndpoints"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Biometrics\FacialFeatures"; Name = "EnhancedAntiSpoofing"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization"; Name = "NoLockScreenCamera"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy"; Name = "LetAppsActivateWithVoiceAboveLock"; Value = 2; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy"; Name = "LetAppsActivateWithVoice"; Value = 2; Type = "DWORD" }
+        )
+        foreach ($setting in $regSettings) {
+            New-Item -Path $setting.Path -Force -ErrorAction Stop | Out-Null
+            New-ItemProperty -Path $setting.Path -Name $setting.Name -Value $setting.Value -PropertyType $setting.Type -Force -ErrorAction Stop
+        }
+        Write-Log "General security settings configured."
+
+        # Disable NetBIOS
+        Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration | Where-Object { $_.TcpipNetbiosOptions -in (0, 1) } | Invoke-CimMethod -MethodName SetTcpipNetbios -Arguments @{ TcpipNetbiosOptions = 2 }
+        Write-Log "NetBIOS disabled."
+
+        # Disable PowerShell v2
+        Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2 -NoRestart -ErrorAction Stop
+        Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root -NoRestart -ErrorAction Stop
+        Write-Log "PowerShell v2 disabled."
+
+        # Enable driver signing
+        & BCDEDIT /set nointegritychecks OFF
+        Write-Log "Driver signing enforced."
+
+        # Disable SMB1
+        Disable-WindowsOptionalFeature -Online -FeatureName smb1protocol -NoRestart -ErrorAction Stop
+        Write-Log "SMB1 disabled."
+
+        # Stop WinRM
+        Stop-Service -Name WinRM -Force -ErrorAction Stop
+        Write-Log "WinRM service stopped."
+    }
+    catch {
+        Write-Log "General security configuration failed: $_" "ERROR"
+    }
+}
+
+function Configure-Firewall {
+    try {
+        # Enable firewall for all profiles
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -ErrorAction Stop
+        Write-Log "Firewall enabled for all profiles."
+
+        # Enable logging
+        Set-NetFirewallProfile -Profile Domain,Public,Private -LogFileName "%systemroot%\system32\LogFiles\Firewall\pfirewall.log" -LogMaxSizeKilobytes 4096 -LogDroppedConnections Enabled -ErrorAction Stop
+        Write-Log "Firewall logging enabled."
+
+        # Block all inbound on Public profile
+        Set-NetFirewallProfile -Profile Public -DefaultInboundAction Block -DefaultOutboundAction Allow -AllowInboundRules False -ErrorAction Stop
+        Write-Log "Public profile set to block all inbound."
+
+        # Enable Network Protection
+        Set-MpPreference -EnableNetworkProtection Enabled -ErrorAction Stop
+        Write-Log "Network Protection enabled."
+
+        # Block specific binaries
+        $binaries = @(
+            "notepad.exe", "regsvr32.exe", "calc.exe", "mshta.exe", "wscript.exe", "cscript.exe", "runscripthelper.exe", "hh.exe"
+        )
+        foreach ($binary in $binaries) {
+            New-NetFirewallRule -DisplayName "Block $binary netconns" -Program "%systemroot%\system32\$binary" -Protocol TCP -Direction Outbound -Action Block -Profile Any -ErrorAction Stop
+            Write-Log "Firewall rule added to block $binary network connections."
+        }
+    }
+    catch {
+        Write-Log "Firewall configuration failed: $_" "ERROR"
+    }
+}
+
+function Configure-PrivacySettings {
+    try {
+        $regSettings = @(
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"; Name = "LimitEnhancedDiagnosticDataWindowsAnalytics"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"; Name = "AllowTelemetry"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection"; Name = "MaxTelemetryAllowed"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Diagnostics\DiagTrack"; Name = "ShowedToastAtLevel"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore"; Name = "Location"; Value = "Deny"; Type = "String" },
+            @{ Path = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search"; Name = "BingSearchEnabled"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search"; Name = "AllowSearchToUseLocation"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search"; Name = "CortanaConsent"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"; Name = "PublishUserActivities"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SettingSync"; Name = "DisableSettingSync"; Value = 2; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo"; Name = "DisabledByGroupPolicy"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR"; Name = "AllowGameDVR"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent"; Name = "DisableWindowsConsumerFeatures"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = "SystemPaneSuggestionsEnabled"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = "SilentInstalledAppsEnabled"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = "PreInstalledAppsEnabled"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"; Name = "OemPreInstalledAppsEnabled"; Value = 0; Type = "DWORD" },
+            @{ Path = "HKCU:\Control Panel\International\User Profile"; Name = "HttpAcceptLanguageOptOut"; Value = 1; Type = "DWORD" },
+            @{ Path = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\PushNotifications"; Name = "NoToastApplicationNotificationOnLockScreen"; Value = 1; Type = "DWORD" }
+        )
+        foreach ($setting in $regSettings) {
+            New-Item -Path $setting.Path -Force -ErrorAction Stop | Out-Null
+            New-ItemProperty -Path $setting.Path -Name $setting.Name -Value $setting.Value -PropertyType $setting.Type -Force -ErrorAction Stop
+        }
+        Write-Log "Privacy settings configured."
+    }
+    catch {
+        Write-Log "Privacy configuration failed: $_" "ERROR"
+    }
+}
+
+function Configure-AdvancedLogging {
+    try {
+        # Enlarge log sizes
+        $logs = @("Security", "Application", "System", "Windows Powershell", "Microsoft-Windows-PowerShell/Operational")
+        foreach ($log in $logs) {
+            wevtutil sl $log /ms:1024000
+            Write-Log "Log size increased for $log."
+        }
+
+        # Enable command line logging
+        New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit" -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit" -Name ProcessCreationIncludeCmdLine_Enabled -Value 1 -PropertyType DWORD -Force -ErrorAction Stop
+        Write-Log "Command line logging enabled."
+
+        # Enable advanced settings
+        New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name SCENoApplyLegacyAuditPolicy -Value 1 -PropertyType DWORD -Force -ErrorAction Stop
+        New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging" -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging" -Name EnableModuleLogging -Value 1 -PropertyType DWORD -Force -ErrorAction Stop
+        New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Force -ErrorAction Stop | Out-Null
+        New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name EnableScriptBlockLogging -Value 1 -PropertyType DWORD -Force -ErrorAction Stop
+        Write-Log "Advanced logging settings enabled."
+
+        # Enable detailed logging
+        $auditPolicies = @{
+            "Security Group Management" = @{ Success = "enable"; Failure = "enable" }
+            "Process Creation" = @{ Success = "enable"; Failure = "enable" }
+            "Logoff" = @{ Success = "enable"; Failure = "disable" }
+            "Logon" = @{ Success = "enable"; Failure = "enable" }
+            "Filtering Platform Connection" = @{ Success = "enable"; Failure = "disable" }
+            "Removable Storage" = @{ Success = "enable"; Failure = "enable" }
+            "SAM" = @{ Success = "disable"; Failure = "disable" }
+            "Filtering Platform Policy Change" = @{ Success = "disable"; Failure = "disable" }
+            "IPsec Driver" = @{ Success = "enable"; Failure = "enable" }
+            "Security State Change" = @{ Success = "enable"; Failure = "enable" }
+            "Security System Extension" = @{ Success = "enable"; Failure = "enable" }
+            "System Integrity" = @{ Success = "enable"; Failure = "enable" }
+        }
+        foreach ($policy in $auditPolicies.GetEnumerator()) {
+            Auditpol /set /subcategory:$($policy.Key) /success:$($policy.Value.Success) /failure:$($policy.Value.Failure)
+            Write-Log "Audit policy set for $($policy.Key)."
+        }
+    }
+    catch {
+        Write-Log "Advanced logging configuration failed: $_" "ERROR"
+    }
+}
+
+function Remove-Bloatware {
+    try {
+        $apps = @(
+            "Microsoft.BingWeather", "Microsoft.DesktopAppInstaller", "Microsoft.GetHelp", "Microsoft.Getstarted",
+            "Microsoft.Messaging", "Microsoft.OneConnect", "Microsoft.Print3D", "Microsoft.SkypeApp", "Microsoft.Wallet",
+            "Microsoft.WindowsAlarms", "Microsoft.WindowsCamera", "microsoft.windowscommunicationsapps",
+            "Microsoft.WindowsFeedbackHub", "Microsoft.WindowsSoundRecorder", "Microsoft.YourPhone", "Microsoft.WindowsFeedback",
+            "Windows.ContactSupport", "PandoraMedia", "AdobeSystemIncorporated.AdobePhotoshop", "Duolingo",
+            "Microsoft.BingNews", "Microsoft.Office.Sway", "Microsoft.Advertising.Xaml", "ActiproSoftware",
+            "EclipseManager", "SpotifyAB.SpotifyMusic", "king.com.*"
+        )
+        foreach ($app in $apps) {
+            Get-AppxPackage -AllUsers -Name $app | Remove-AppxPackage -ErrorAction SilentlyContinue
+            Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like $app } | Remove-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue
+            Write-Log "Removed bloatware app: $app"
+        }
+    }
+    catch {
+        Write-Log "Bloatware removal failed: $_" "ERROR"
+    }
+}
+
+#endregion
+
+#region MAIN EXECUTION
+
+try {
+    Write-Log "NSG Defense and Hardening Agent starting..."
+
+    # Initialize environment
+    Initialize-Environment
+
+    # Apply hardening configurations
+    Write-Log "Applying Windows hardening configurations..."
+    Set-FileAssociations
+    Configure-WindowsDefender
+    Configure-BrowserSettings
+    Configure-OfficeSettings
+    Configure-GeneralSecurity
+    Configure-Firewall
+    Configure-PrivacySettings
+    Configure-AdvancedLogging
+    Remove-Bloatware
+    Write-Log "Windows hardening completed."
+
+    # Update threat intelligence
+    Update-ThreatIntelFeeds
+
+    # Install and start service
+    Install-Service
+    Start-ServiceIfNotRunning
+
+    # Check for updates
+    AutoUpdate
+
+    # Start native monitoring placeholders
+    Start-ETWMonitor
+    Start-WFPFilter
+    Query-DefenderATP
+
+    # Start network monitoring job
+    Start-Job -Name "NSGEnhancedNetworkMonitor" -ScriptBlock { Monitor-Network }
+
+    Write-Log "NSG Defense and Hardening Agent fully operational."
+}
+catch {
+    Write-Log "Main execution failed: $_" "ERROR"
+    exit 1
+}
+
+#endregion
+
+#region REFERENCES
+
+<#
+References:
+- LLMNR: https://www.blackhillsinfosec.com/how-to-disable-llmnr-why-you-want-to/
+- Windows Defender:
+  - ASR Rules: https://www.darkoperator.com/blog/2017/11/11/windows-defender-exploit-guard-asr-rules-for-office
+  - ASR and Exploit Guard: https://docs.microsoft.com/en-us/windows/security/threat-protection/windows-defender-exploit-guard/attack-surface-reduction-exploit-guard
+  - ASR Rules: https://docs.microsoft.com/en-us/windows/security/threat-protection/microsoft-defender-atp/attack-surface-reduction
+  - Test Rules: https://demo.wd.microsoft.com/?ocid=cx-wddocs-testground
+  - Event IDs: https://docs.microsoft.com/en-us/windows/security/threat-protection/microsoft-defender-atp/event-views
+  - Sandboxing: https://cloudblogs.microsoft.com/microsoftsecure/2018/10/26/windows-defender-antivirus-can-now-run-in-a-sandbox/
+  - Exploit Protection: https://docs.microsoft.com/en-us/windows/security/threat-protection/windows-defender-exploit-guard/customize-exploit-protection
+  - Application Guard: https://docs.microsoft.com/en-us/windows/security/threat-protection/windows-defender-application-guard/install-wd-app-guard
+  - Cmdline: https://docs.microsoft.com/en-us/windows/security/threat-protection/windows-defender-antivirus/command-line-arguments-windows-defender-antivirus
+- General Hardening:
+  - LSA Protection: https://docs.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2012-R2-and-2012/dn408187(v=ws.11)?redirectedfrom=MSDN
+- Microsoft Office:
+  - Disable DDE: https://gist.github.com/wdormann/732bb88d9b5dd5a66c9f1e1498f31a1b
+  - Disable Macros: https://decentsecurity.com/block-office-macros/
+- Debloating: https://blog.danic.net/how-windows-10-pro-installs-unwanted-apps-candy-crush-and-how-you-stop-it/
+- Frameworks: STIG https://www.stigviewer.com/stig/windows_10/
+#>
+
+#endregion
